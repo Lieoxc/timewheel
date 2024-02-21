@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/demdxx/gocast"
 	"github.com/go-redis/redis/v7"
 )
 
@@ -81,6 +82,27 @@ var (
 	end
 	return scnt
  `
+	// 3 执行任务时，通过 zrange 操作取回所有不存在删除 key 标识的任务
+	LuaZrangeTasks = `
+	local zsetKey = KEYS[1]
+	local deleteSetKey = KEYS[2]
+	local score1 = ARGV[1]
+	local score2 = ARGV[2]
+	-- 获取到已删除任务的集合
+	local deleteSet = redis.call('smembers',deleteSetKey)
+	-- 根据秒级时间戳对 zset 进行 zrange 检索，获取到满足时间条件的定时任务
+	local targets = redis.call('zrange',zsetKey,score1,score2,'byscore')
+	-- 检索到的定时任务直接从时间轮中移除，保证分布式场景下定时任务不被重复获取
+	redis.call('zremrangebyscore',zsetKey,score1,score2)
+	-- lua的返回是table
+	local reply = {}
+	reply[1] = deleteSet
+
+	for i, v in ipairs(targets) do
+		reply[#reply+1]=v
+	end
+	return reply
+`
 )
 
 const (
@@ -124,5 +146,49 @@ func (r *RTimeWheel) getDeleteSetKey(runTime time.Time) string {
 }
 
 func (r *RTimeWheel) executeTasks() {
+	// 根据当前时间条件扫描redis 有序集合，获取满足执行条件的定时任务
+}
+func getTimeSecond(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+}
+func (r *RTimeWheel) getExecutableTasks() ([]*RTaskElement, error) {
+	now := time.Now()
+	minuteZsetVal := r.getMinuteSlice(now)
+	deleteSetKey := r.getDeleteSetKey(now)
+	nowSecond := getTimeSecond(now)
+	score1 := nowSecond.Unix()
+	score2 := nowSecond.Add(time.Second).Unix()
+	rawReply, err := r.redisClient.Eval(LuaZrangeTasks,
+		[]string{minuteZsetVal, deleteSetKey},  // 此时刻需要查询的有序列表key，以及应该删除的集合key
+		[]interface{}{score1, score2}).Result() // 检索的上下限分数
 
+	if err != nil {
+		return nil, err
+	}
+	//lua脚本中首个返回元素为已删除任务的key 集合
+	replies := gocast.ToInterfaceSlice(rawReply)
+	if len(replies) == 0 {
+		return nil, fmt.Errorf("invalid replies: %v", replies)
+	}
+	// deleteds 里面的元素就是调用 RemoveTask 的时候，移动到 deleteSetKey 这个集合里面的元素
+	deleteds := gocast.ToStringSlice(replies[0])
+	deletedSet := make(map[string]struct{}, len(deleteds))
+	for _, deleted := range deleteds {
+		deletedSet[deleted] = struct{}{}
+	}
+	// 遍历各个定时任务
+	tasks := make([]*RTaskElement, 0, len(replies)-1)
+	for i := 1; i < len(replies); i++ {
+		var task RTaskElement
+		if err := json.Unmarshal([]byte(gocast.ToString(replies[i])), &task); err != nil {
+			// TODO add warning log
+			continue
+		}
+		// 这个任务在待删除集合里面，所以过滤掉
+		if _, ok := deletedSet[task.key]; ok {
+			continue
+		}
+		tasks = append(tasks, &task)
+	}
+	return tasks, nil
 }
