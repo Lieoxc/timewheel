@@ -18,44 +18,9 @@ type RTimeWheel struct {
 }
 type RTaskElement struct {
 	// 定时任务全局唯一 key
-	key string `json:"key"`
-	// 定时任务执行时，回调的 http url
-	CallbackURL string `json:"callback_url"`
-	// 回调时使用的 http 方法
-	Method string `json:"method"`
-	// 回调时传递的请求参数
-	Req interface{} `json:"req"`
-	// 回调时使用的 http 请求头
-	Header map[string]string `json:"header"`
-}
-
-// 外部创建一个时间轮
-func NewRTimeWheel(redisClient *redis.Client) *RTimeWheel {
-	r := &RTimeWheel{
-		redisClient: redisClient,
-		ticker:      *time.NewTicker(time.Second),
-		stopc:       make(chan struct{}),
-	}
-	go r.Run()
-	return r
-}
-func (r *RTimeWheel) Run() {
-	for {
-		select {
-		case <-r.stopc: //接收到退出信息
-			return
-		case <-r.ticker.C: // 滴答定时器发送信号
-			go r.executeTasks()
-		}
-	}
-}
-
-// 外部调用停止 时间轮
-func (r *RTimeWheel) Stop() {
-	r.Do(func() {
-		close(r.stopc)
-		r.ticker.Stop()
-	})
+	Key string `json:"key"`
+	// 定时任务执行时，需要的数据
+	Data string `json:"data"`
 }
 
 var (
@@ -109,10 +74,41 @@ const (
 	YYYY_MM_DD_HH_MM = "2006-01-02-15:04"
 )
 
+// 外部创建一个时间轮
+func NewRTimeWheel(redisClient *redis.Client) *RTimeWheel {
+	r := &RTimeWheel{
+		redisClient: redisClient,
+		ticker:      *time.NewTicker(time.Second),
+		stopc:       make(chan struct{}),
+	}
+	go r.Run()
+	return r
+}
+
+// 后台协程
+func (r *RTimeWheel) Run() {
+	for {
+		select {
+		case <-r.stopc: //接收到退出信息
+			return
+		case <-r.ticker.C: // 滴答定时器发送信号
+			go r.executeTasks()
+		}
+	}
+}
+
+// 外部调用停止 时间轮
+func (r *RTimeWheel) Stop() {
+	r.Do(func() {
+		close(r.stopc)
+		r.ticker.Stop()
+	})
+}
+
 // 添加定时任务
 func (r *RTimeWheel) AddTask(key string, task *RTaskElement, runTime time.Time) error {
 	//
-	task.key = key
+	task.Key = key
 	taskBody, _ := json.Marshal(task)
 	//
 	err := r.redisClient.Eval(addTaskScript,
@@ -135,22 +131,36 @@ func (r *RTimeWheel) RemoveTask(key string, runTime time.Time) error {
 	return err
 }
 
-// 获取redis有序集合表 里面对应的分钟key
-func (r *RTimeWheel) getMinuteSlice(runTime time.Time) string {
-	return fmt.Sprintf("timeWheel_task_{%s}", runTime.Format(YYYY_MM_DD_HH_MM))
-}
-
-// 获取redis有序集合表 里面对应的分钟key
-func (r *RTimeWheel) getDeleteSetKey(runTime time.Time) string {
-	return fmt.Sprintf("timeWheel_delSet_{%s}", runTime.Format(YYYY_MM_DD_HH_MM))
-}
-
 func (r *RTimeWheel) executeTasks() {
 	// 根据当前时间条件扫描redis 有序集合，获取满足执行条件的定时任务
+	task, err := r.getExecutableTasks()
+	if err != nil {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, task := range task {
+		wg.Add(1)
+		Runtask := task
+		go func() {
+			defer func() {
+				if err := recover(); err != nil {
+
+				}
+				wg.Done()
+			}()
+			//执行定时任务
+			if err := r.executeTask(Runtask); err != nil {
+				// do some thing
+			}
+		}()
+	}
+	wg.Wait() // 等待所有任务执行完成
 }
-func getTimeSecond(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+func (r *RTimeWheel) executeTask(task *RTaskElement) error {
+	// TODO do something
+	return nil
 }
+
 func (r *RTimeWheel) getExecutableTasks() ([]*RTaskElement, error) {
 	now := time.Now()
 	minuteZsetVal := r.getMinuteSlice(now)
@@ -191,4 +201,18 @@ func (r *RTimeWheel) getExecutableTasks() ([]*RTaskElement, error) {
 		tasks = append(tasks, &task)
 	}
 	return tasks, nil
+}
+
+// 获取redis有序集合表 里面对应的分钟key
+func (r *RTimeWheel) getMinuteSlice(runTime time.Time) string {
+	return fmt.Sprintf("timeWheel_task_{%s}", runTime.Format(YYYY_MM_DD_HH_MM))
+}
+
+// 获取redis有序集合表 里面对应的分钟key
+func (r *RTimeWheel) getDeleteSetKey(runTime time.Time) string {
+	return fmt.Sprintf("timeWheel_delSet_{%s}", runTime.Format(YYYY_MM_DD_HH_MM))
+}
+
+func getTimeSecond(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
 }
