@@ -43,7 +43,7 @@ var (
 	local scnt = redis.call('scard',deleteSetKey)
 	if (tonumber(scnt) == 1)
 	then
-		redis.call('expire',deleteSetKey,120)
+		redis.call('expire',deleteSetKey,120) --deleteSetKey 有效期2min，使用redis的清理机制去清空 待删除任务集合
 	end
 	return scnt
  `
@@ -163,8 +163,9 @@ func (r *RTimeWheel) executeTask(task *RTaskElement) error {
 
 func (r *RTimeWheel) getExecutableTasks() ([]*RTaskElement, error) {
 	now := time.Now()
-	minuteZsetVal := r.getMinuteSlice(now)
-	deleteSetKey := r.getDeleteSetKey(now)
+	minuteZsetVal := r.getMinuteSlice(now) // 待执行任务 的有序集合key
+	deleteSetKey := r.getDeleteSetKey(now) //待删除任务集合key
+
 	nowSecond := getTimeSecond(now)
 	score1 := nowSecond.Unix()
 	score2 := nowSecond.Add(time.Second).Unix()
@@ -195,7 +196,7 @@ func (r *RTimeWheel) getExecutableTasks() ([]*RTaskElement, error) {
 			continue
 		}
 		// 这个任务在待删除集合里面，所以过滤掉
-		if _, ok := deletedSet[task.key]; ok {
+		if _, ok := deletedSet[task.Key]; ok {
 			continue
 		}
 		tasks = append(tasks, &task)
